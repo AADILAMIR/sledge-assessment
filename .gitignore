@@ -1,0 +1,26 @@
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+
+# Node
+app/node_modules/
+app/coverage/
+
+# Terraform (per-layer roots)
+infra/**/.terraform/
+infra/**/terraform.tfstate
+infra/**/terraform.tfstate.*
+infra/**/terraform.tfstate.d/
+infra/**/tfplan
+infra/**/*.tfplan
+infra/**/*.auto.tfvars
+infra/**/crash.log
+infra/**/crash.*.log
+
+# Local CI artifacts
+terraform-plan-ci.txt
+
+# Only the composition root owns provider selections
+infra/*/.terraform.lock.hcl

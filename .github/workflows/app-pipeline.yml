@@ -1,0 +1,193 @@
+name: app-pipeline
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        required: true
+        type: string
+      app_directory:
+        required: true
+        type: string
+      project_name:
+        required: true
+        type: string
+      target_branch:
+        required: true
+        type: string
+      deploy_enabled:
+        required: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ENVIRONMENT: ${{ inputs.target_branch == 'main' && 'prod' || inputs.target_branch == 'staging' && 'staging' || 'dev' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.app_directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ${{ inputs.app_directory }}/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  secret-scan:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: trufflesecurity/trufflehog@v3.88.16
+        with:
+          extra_args: --results=verified,unknown --fail
+
+  dependency-scan:
+    needs: test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.app_directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ${{ inputs.app_directory }}/package-lock.json
+      - run: npm ci
+      - run: npm audit
+
+  build-and-scan:
+    needs: [secret-scan, dependency-scan]
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          echo "image_tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "local_ref=${APP_NAME}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./${{ inputs.app_directory }}
+          file: ./${{ inputs.app_directory }}/Dockerfile
+          load: true
+          tags: ${{ steps.meta.outputs.local_ref }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.meta.outputs.local_ref }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          format: table
+      - run: docker save "${{ steps.meta.outputs.local_ref }}" -o /tmp/app-image.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.app_name }}-image
+          path: /tmp/app-image.tar
+          retention-days: 1
+
+  infra-validate:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - run: terraform fmt -check -recursive infra
+      - working-directory: infra
+        run: |
+          terraform init -input=false -backend=false
+          terraform validate
+
+  deploy:
+    needs: [build-and-scan, infra-validate]
+    if: inputs.deploy_enabled
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target_branch == 'main' && 'prod' || inputs.target_branch == 'staging' && 'staging' || 'dev' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: test -f terraform-plan.txt
+      - name: Configure AWS credentials
+        if: vars.AWS_DEPLOY_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: No deployment role configured
+        if: vars.AWS_DEPLOY_ROLE_ARN == ''
+        run: echo "AWS_DEPLOY_ROLE_ARN is not configured; deployment skipped."
+      - uses: actions/download-artifact@v4
+        if: vars.AWS_DEPLOY_ROLE_ARN != ''
+        with:
+          name: ${{ inputs.app_name }}-image
+          path: /tmp
+      - name: Push image
+        if: vars.AWS_DEPLOY_ROLE_ARN != ''
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          IMAGE_TAG: ${{ needs.build-and-scan.outputs.image_tag }}
+        run: |
+          docker load -i /tmp/app-image.tar
+          ECR_REPOSITORY="${APP_NAME}-registry-${ENVIRONMENT}"
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          aws ecr get-login-password --region "${AWS_REGION}" |
+            docker login --username AWS --password-stdin "${REGISTRY}"
+          docker tag "${APP_NAME}:${IMAGE_TAG}" "${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker push "${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          echo "IMAGE_URI=${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" >> "$GITHUB_ENV"
+      - name: Deploy to ECS
+        if: vars.AWS_DEPLOY_ROLE_ARN != '' && vars.ECS_CLUSTER != ''
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          PROJECT_NAME: ${{ inputs.project_name }}
+          ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+        run: |
+          ECS_SERVICE="${PROJECT_NAME}-${ENVIRONMENT}-${APP_NAME}"
+          TASK_DEFINITION="$(aws ecs describe-services \
+            --cluster "${ECS_CLUSTER}" \
+            --services "${ECS_SERVICE}" \
+            --query 'services[0].taskDefinition' \
+            --output text)"
+          aws ecs describe-task-definition \
+            --task-definition "${TASK_DEFINITION}" \
+            --query taskDefinition > /tmp/task-definition.json
+          jq --arg image "${IMAGE_URI}" --arg name "${APP_NAME}" '
+            del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                .compatibilities, .registeredAt, .registeredBy)
+            | .containerDefinitions |= map(if .name == $name then .image = $image else . end)
+          ' /tmp/task-definition.json > /tmp/task-definition-new.json
+          NEW_TASK_DEFINITION="$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/task-definition-new.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)"
+          aws ecs update-service \
+            --cluster "${ECS_CLUSTER}" \
+            --service "${ECS_SERVICE}" \
+            --task-definition "${NEW_TASK_DEFINITION}" \
+            --desired-count 1
+          aws ecs wait services-stable \
+            --cluster "${ECS_CLUSTER}" \
+            --services "${ECS_SERVICE}"

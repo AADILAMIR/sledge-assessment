@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [develop, staging, main]
+  pull_request:
+    branches: [develop, staging, main]
+
+permissions:
+  contents: read
+
+jobs:
+  api:
+    uses: ./.github/workflows/app-pipeline.yml
+    with:
+      app_name: api
+      app_directory: app
+      project_name: sledge-api
+      target_branch: ${{ github.event_name == 'pull_request' && github.base_ref || github.ref_name }}
+      deploy_enabled: ${{ github.event_name == 'push' }}
+    secrets: inherit
