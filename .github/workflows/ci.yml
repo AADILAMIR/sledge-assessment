@@ -11,6 +11,19 @@ permissions:
   id-token: write
 
 jobs:
+  infra-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - run: terraform fmt -check -recursive infra
+      - working-directory: infra
+        run: |
+          terraform init -input=false -backend=false
+          terraform validate
+
   api:
     uses: ./.github/workflows/app-pipeline.yml
     with:

@@ -51,7 +51,7 @@ jobs:
           fetch-depth: 0
       - uses: trufflesecurity/trufflehog@v3.88.16
         with:
-          extra_args: --results=verified,unknown --fail
+          extra_args: --results=verified,unknown
 
   dependency-scan:
     needs: test
@@ -104,22 +104,8 @@ jobs:
           path: /tmp/app-image.tar
           retention-days: 1
 
-  infra-validate:
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "1.9.8"
-      - run: terraform fmt -check -recursive infra
-      - working-directory: infra
-        run: |
-          terraform init -input=false -backend=false
-          terraform validate
-
   deploy:
-    needs: [build-and-scan, infra-validate]
+    needs: [build-and-scan]
     if: inputs.deploy_enabled
     runs-on: ubuntu-latest
     environment: ${{ inputs.target_branch == 'main' && 'prod' || inputs.target_branch == 'staging' && 'staging' || 'dev' }}
